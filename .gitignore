@@ -10,4 +10,5 @@ __pycache__/
 *.log
 coverage.xml
 .coverage
+**/config.local.toml
 

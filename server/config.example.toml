@@ -1,0 +1,9 @@
+host = "127.0.0.1"
+port = 9443
+public_url = "https://localhost:9443"
+data_dir = "../.local/server"
+cert_file = "../.local/tls/localhost.pem"
+key_file = "../.local/tls/localhost-key.pem"
+redirect_uris = ["https://localhost:8443/auth/callback"]
+allowed_origins = []
+token_ttl = 28800

@@ -1,0 +1,16 @@
+host = "127.0.0.1"
+port = 8443
+public_url = "https://localhost:8443"
+mcp_url = "https://localhost:9443/mcp"
+ca_file = "../.local/tls/ca.pem"
+cert_file = "../.local/tls/localhost.pem"
+key_file = "../.local/tls/localhost-key.pem"
+# Set MCP_AGENT_COOKIE_SECRET identically on interchangeable client instances.
+
+[model_defaults]
+provider = "openai"
+model = ""
+base_url = ""
+api_format = "auto"
+max_output_tokens = 8192
+context_window = 128000
