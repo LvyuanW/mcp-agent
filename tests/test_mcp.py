@@ -113,6 +113,14 @@ class MCPTests(unittest.TestCase):
             client.call_tool("session_claim", {})
         self.assertEqual(caught.exception.data, {"error": "lease conflict"})
 
+    def test_domain_failure_exposes_code_and_human_message(self):
+        detail = {"error": {"code": "lease_conflict", "message": "Another runner owns this session"}}
+        client = self.client(lambda req: result(req, {"isError": True, "structuredContent": detail}))
+        with self.assertRaisesRegex(MCPToolError, "Another runner") as caught:
+            client.call_tool("shell", {"command": "pwd"})
+        self.assertEqual(caught.exception.code, "lease_conflict")
+        self.assertEqual(caught.exception.data, detail)
+
     def test_header_sentinel_is_unambiguous(self):
         self.assertEqual(encode_header("ordinary"), "ordinary")
         self.assertTrue(encode_header(" padded ").startswith("=?base64?"))

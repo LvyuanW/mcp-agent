@@ -59,9 +59,13 @@ class RemoteSession:
         self.stopped = threading.Event()
         self.cancelled = threading.Event()
         self.lost = None
+        started = time.monotonic()
         claim = self.mcp.call_tool("session_claim", {"session_id": session_id, "owner": self.owner, "ttl": ttl})
         self.token = claim["lease_token"]
         self.data = claim["session"]
+        self.epoch = self.data["lease"]["epoch"]
+        # Start before the request: network delay must never extend ownership.
+        self.deadline = started + ttl
         self.thread = threading.Thread(target=self._renew, name="session-lease", daemon=True)
         self.thread.start()
 
@@ -69,8 +73,12 @@ class RemoteSession:
         while not self.stopped.wait(self.ttl / 3):
             try:
                 with self.lock:
+                    self._check_lease()
+                    started = time.monotonic()
                     result = self.mcp.call_tool("session_claim", {"session_id": self.id, "owner": self.owner, "ttl": self.ttl})
-                    self.token = result["lease_token"]
+                    if result["lease_token"] != self.token:
+                        raise LeaseLost("续租期间原租约已过期。")
+                    self.deadline = started + self.ttl
                     self.data = result["session"]
                     if self.data.get("cancel_requested"):
                         self.cancelled.set()
@@ -79,10 +87,21 @@ class RemoteSession:
                 return
 
     def check(self):
-        if self.lost is not None:
-            raise LeaseLost("会话执行租约已失效，请重新接管会话。") from self.lost
+        self._check_lease()
         if self.cancelled.is_set():
             raise RunCancelled("用户已取消执行。")
+
+    def _check_lease(self):
+        if time.monotonic() >= self.deadline and self.lost is None:
+            self.lost = LeaseLost("会话执行租约已过期。")
+        if self.lost is not None:
+            raise LeaseLost("会话执行租约已失效，请重新接管会话。") from self.lost
+
+    def _verify_owner(self):
+        lease = self.data.get("lease") or {}
+        if lease.get("owner") != self.owner or lease.get("epoch") != self.epoch:
+            self.lost = LeaseLost("其他进程已接管会话。")
+        self._check_lease()
 
     def snapshot(self):
         with self.lock:
@@ -90,23 +109,32 @@ class RemoteSession:
 
     def refresh(self):
         with self.lock:
+            self._check_lease()
             self.data = self.mcp.call_tool("session_get", {"session_id": self.id})
+            self._verify_owner()
             if self.data.get("cancel_requested"):
                 self.cancelled.set()
             return deepcopy(self.data)
 
     def update(self, **patch):
         with self.lock:
-            if self.lost is not None:
-                raise LeaseLost("会话执行租约已失效。") from self.lost
-            self.data = self.mcp.call_tool("session_update", {
-                "session_id": self.id, "expected_revision": self.data["revision"],
-                "patch": patch, "lease_token": self.token,
-            })
+            self._check_lease()
+            try:
+                self.data = self.mcp.call_tool("session_update", {
+                    "session_id": self.id, "expected_revision": self.data["revision"],
+                    "patch": patch, "lease_token": self.token,
+                })
+            except MCPToolError as exc:
+                if exc.code == "lease_conflict":
+                    self.lost = exc
+                    raise LeaseLost("会话执行租约已失效。") from exc
+                raise
+            self._verify_owner()
             return deepcopy(self.data)
 
     def context(self, operation_id=None):
         with self.lock:
+            self.check()
             result = {"session_id": self.id, "lease_token": self.token}
             if operation_id:
                 result["operation_id"] = operation_id
@@ -144,6 +172,10 @@ class RemoteTools:
         try:
             return self.mcp.call_tool(name, arguments, context)
         except MCPToolError as exc:
+            if exc.code == "lease_conflict":
+                raise LeaseLost("远程工具拒绝了过期的会话租约。") from exc
+            if exc.code == "cancelled":
+                raise RunCancelled("用户已取消执行。") from exc
             return {"isError": True, "error": str(exc), "details": exc.data}
 
 
@@ -171,6 +203,10 @@ class AgentRunner:
             if initial.get("cancel_requested"):
                 session.cancelled.set()
                 raise RunCancelled("用户已取消执行。")
+            messages = initial.get("messages", [])
+            if (not initial.get("pending") and messages and messages[-1].get("role") == "assistant"
+                    and not messages[-1].get("tool_calls")):
+                return session.update(status="completed", activity=None, draft=None, error=None)
             tools = RemoteTools(self.mcp)
             workspace = self.mcp.call_tool("workspace_info", {})
             model = self.model_factory(initial.get("config") or {})
@@ -192,6 +228,7 @@ class AgentRunner:
                 messages = state.get("messages", [])
                 if messages and messages[-1].get("role") == "assistant" and not messages[-1].get("tool_calls"):
                     return session.update(status="completed", activity=None, draft=None, error=None)
+                tools.refresh()
                 system_message, working, context = prepare_context(
                     state, model, system, tools.schemas,
                     on_activity=lambda activity: session.update(activity=activity),
@@ -308,7 +345,7 @@ class AgentRunner:
         while True:
             session.refresh()
             if session.cancelled.is_set():
-                self.mcp.call_tool("job_cancel", {"job_id": job_id})
+                self.mcp.call_tool("job_cancel", {"job_id": job_id}, self._cancel_context(session))
             session.check()
             result = self.mcp.call_tool("job_status", {"job_id": job_id, "offset": 0, "max_bytes": 262144})
             session.update(activity={"kind": "job", "job_id": job_id, "status": result.get("status"),
@@ -325,7 +362,7 @@ class AgentRunner:
         for call in pending.get("calls", [])[pending.get("index", 0):]:
             job_id = call.get("job_id")
             if job_id:
-                self.mcp.call_tool("job_cancel", {"job_id": job_id})
+                self.mcp.call_tool("job_cancel", {"job_id": job_id}, self._cancel_context(session))
             result = {"isError": True, "status": "cancelled", "error": "用户取消了本次执行。"}
             if job_id:
                 result["job_id"] = job_id
@@ -333,3 +370,11 @@ class AgentRunner:
                              "content": json.dumps(result, ensure_ascii=False), "operation_id": call["operation_id"]})
         session.update(messages=messages, pending=None, status="cancelled", error=None,
                        activity=None, draft=None, cancel_requested=False)
+
+    @staticmethod
+    def _cancel_context(session):
+        # Cancellation itself must remain possible after the cancel flag is set,
+        # but never after another runner has acquired the execution lease.
+        with session.lock:
+            session._check_lease()
+            return {"session_id": session.id, "lease_token": session.token}

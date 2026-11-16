@@ -8,7 +8,7 @@ import unittest
 
 from client.context import message_groups, prepare_context
 from client.mcp import MCPToolError, MCPTransportError
-from client.runtime import AgentRunner, RemoteSession, RemoteTools
+from client.runtime import AgentRunner, LeaseLost, RemoteSession, RemoteTools
 from server.workspace import WorkspaceService
 
 
@@ -29,7 +29,8 @@ class InProcessMCP:
         try:
             result = self.service.call(self.tenant, name, arguments, context)
         except (ValueError, LookupError, RuntimeError) as exc:
-            raise MCPToolError(str(exc), data={"error": str(exc)}) from exc
+            raise MCPToolError(str(exc), code=getattr(exc, "code", "tool_error"),
+                               data={"error": {"code": getattr(exc, "code", "tool_error"), "message": str(exc)}}) from exc
         if name == "shell":
             self.shell_operations.append(context["operation_id"])
             if self.fail_after_shell:
@@ -163,6 +164,89 @@ class RuntimeTests(unittest.TestCase):
                 RemoteSession(InProcessMCP(self.service), self.session["id"])
         finally:
             first.close()
+
+    def test_completed_replay_never_constructs_or_calls_a_provider(self):
+        result = AgentRunner(self.mcp, lambda config: Model(), poll_interval=0.02).run(self.session["id"])
+
+        def no_provider(config):
+            self.fail("Completed replay must not need model credentials or inference")
+
+        replay = AgentRunner(InProcessMCP(self.service), no_provider).run(self.session["id"])
+        self.assertEqual(replay["status"], "completed")
+        self.assertEqual(replay["messages"], result["messages"])
+
+    def test_cancelled_work_can_resume_after_signal_is_acknowledged(self):
+        AgentRunner(self.mcp).cancel(self.session["id"])
+        stopped = AgentRunner(self.mcp, lambda config: self.fail("Cancelled work invoked provider")).run(self.session["id"])
+        self.assertEqual(stopped["status"], "cancelled")
+        self.assertFalse(stopped["cancel_requested"])
+        resumed = AgentRunner(InProcessMCP(self.service), lambda config: Model(), poll_interval=0.02).run(self.session["id"])
+        self.assertEqual(resumed["status"], "completed")
+
+    def test_stale_lease_cannot_dispatch_shell_or_overwrite_new_runner(self):
+        service = self.service
+        session_id = self.session["id"]
+
+        class TakeoverMCP(InProcessMCP):
+            def call_tool(inner, name, arguments, context=None):
+                if name == "shell":
+                    # Simulate a stopped process resuming after its lease expired.
+                    with service._connection(transaction=True) as connection:
+                        connection.execute("UPDATE sessions SET lease_expires = 0 WHERE id = ?", (session_id,))
+                    service.call("alice", "session_claim", {"session_id": session_id, "owner": "replacement", "ttl": 30})
+                return super().call_tool(name, arguments, context)
+
+        with self.assertRaises(LeaseLost):
+            AgentRunner(TakeoverMCP(self.service), lambda config: Model("touch forbidden")).run(session_id)
+        with self.service._connection() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+        current = self.mcp.call_tool("session_get", {"session_id": session_id})
+        self.assertEqual(current["lease"]["owner"], "replacement")
+        self.assertEqual(current["status"], "running")
+        self.assertIsNotNone(current["pending"])
+        self.assertFalse((self.workspace / "forbidden").exists())
+
+    def test_expired_local_lease_is_not_renewed_or_used(self):
+        session = RemoteSession(self.mcp, self.session["id"])
+        try:
+            session.deadline = 0
+            with self.assertRaises(LeaseLost):
+                session.context("stale-operation")
+        finally:
+            session.close()
+
+    def test_tools_added_remotely_are_discovered_on_next_model_turn(self):
+        class ChangingMCP(InProcessMCP):
+            available = False
+            called = False
+
+            def list_tools(inner):
+                specs = super().list_tools()
+                if inner.available:
+                    specs += [{"name": "new_remote_tool", "description": "Added by remote workspace", "inputSchema": {"type": "object"}}]
+                return specs
+
+            def call_tool(inner, name, arguments, context=None):
+                if name == "new_remote_tool":
+                    inner.called = True
+                    return {"observed": "remote plugin"}
+                result = super().call_tool(name, arguments, context)
+                if name == "shell":
+                    inner.available = True
+                return result
+
+        class ChangingModel(Model):
+            def complete(inner, system, messages, tools, **kwargs):
+                if messages[-1]["role"] == "tool" and messages[-1].get("name") == "shell":
+                    self.assertIn("new_remote_tool", {tool["name"] for tool in tools})
+                    return {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "dynamic-call", "name": "new_remote_tool", "arguments": "{}"}]}
+                return super().complete(system, messages, tools, **kwargs)
+
+        mcp = ChangingMCP(self.service)
+        result = AgentRunner(mcp, lambda config: ChangingModel(), poll_interval=0.02).run(self.session["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(mcp.called)
 
     def test_runtime_control_tools_are_never_model_callable(self):
         registry = RemoteTools(self.mcp)

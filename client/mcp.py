@@ -197,6 +197,8 @@ class MCPClient:
             raise MCPError("MCP response ID or JSON-RPC version does not match the request")
         if "error" in message:
             problem = message["error"]
+            if not isinstance(problem, dict):
+                raise MCPError("MCP JSON-RPC error must be an object")
             raise MCPError(problem.get("message", "MCP request failed"), code=problem.get("code"), data=problem.get("data"))
         result = message.get("result")
         if not isinstance(result, dict):
@@ -243,8 +245,10 @@ class MCPClient:
             except (ValueError, TypeError):
                 structured = {"content": content}
         if result.get("isError"):
-            message = structured.get("error", "Remote tool failed") if isinstance(structured, dict) else str(structured)
-            raise MCPToolError(str(message), data=structured)
+            problem = structured.get("error", "Remote tool failed") if isinstance(structured, dict) else str(structured)
+            message = problem.get("message", "Remote tool failed") if isinstance(problem, dict) else str(problem)
+            code = problem.get("code") if isinstance(problem, dict) else None
+            raise MCPToolError(message, code=code, data=structured)
         if result.get("resultType") == "input_required":
             raise MCPToolError("Remote tool requires interactive input", data=result)
         return structured if isinstance(structured, dict) else {"value": structured}
