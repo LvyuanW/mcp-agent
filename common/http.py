@@ -2,7 +2,6 @@ import base64
 import hashlib
 import hmac
 import json
-import secrets
 import ssl
 import time
 import tomllib
@@ -11,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-MAX_BODY = 4 * 1024 * 1024
+MAX_BODY = 12 * 1024 * 1024
 
 
 def load_config(path, defaults):
@@ -82,7 +81,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Transfer-Encoding is unsupported; send Content-Length")
         length = int(self.headers.get("Content-Length", "0"))
         if length < 0 or length > MAX_BODY:
-            raise ValueError("Request body exceeds the 4 MiB limit")
+            raise ValueError("Request body exceeds the 12 MiB limit")
         self.connection.settimeout(30)
         data = self.rfile.read(length)
         if len(data) != length:

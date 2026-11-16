@@ -68,14 +68,28 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(principal.tenant_id, "tenant-a")
         rotated = self.auth.token({"grant_type": "refresh_token", "client_id": "mcp-agent-web",
             "resource": self.params["resource"], "refresh_token": tokens["refresh_token"]})
-        with self.assertRaises(AuthError):
-            self.auth.token({"grant_type": "refresh_token", "client_id": "mcp-agent-web",
-                "resource": self.params["resource"], "refresh_token": tokens["refresh_token"]})
+        self.assertEqual(self.auth.verify(rotated["access_token"]).tenant_id, "tenant-a")
         self.auth.revoke(rotated["refresh_token"])
         with self.assertRaises(AuthError):
             self.auth.verify(tokens["access_token"])
         with self.assertRaises(AuthError):
             self.auth.verify(rotated["access_token"])
+
+    def test_replayed_refresh_token_revokes_its_grant_and_successors(self):
+        original = self.exchange(self.auth.authorize(self.params, "alice", "a-secure-test-password"))
+        independent = self.exchange(self.auth.authorize(self.params, "alice", "a-secure-test-password"))
+        refresh = {"grant_type": "refresh_token", "client_id": "mcp-agent-web",
+                   "resource": self.params["resource"], "refresh_token": original["refresh_token"]}
+        successor = self.auth.token(refresh)
+        with self.assertRaises(AuthError):
+            self.auth.token(refresh)
+        # Each verification opens a new DB connection, so this checks committed revocation.
+        for token in (original["access_token"], successor["access_token"]):
+            with self.assertRaises(AuthError):
+                self.auth.verify(token)
+        with self.assertRaises(AuthError):
+            self.auth.token({**refresh, "refresh_token": successor["refresh_token"]})
+        self.assertEqual(self.auth.verify(independent["access_token"]).tenant_id, "tenant-a")
 
     def test_redirect_resource_and_scope_are_validated(self):
         for changes in ({"redirect_uri": "https://attacker.test/callback"},
@@ -181,6 +195,7 @@ class HTTPIntegrationTests(unittest.TestCase):
         with self.assertRaises(error.HTTPError) as caught:
             self.api("/api/sessions", {}, origin="https://attacker.test")
         self.assertEqual(caught.exception.code, 403)
+        caught.exception.close()
 
     def test_mcp_headers_origin_and_tenant_authorization(self):
         token = self.login()
@@ -195,11 +210,72 @@ class HTTPIntegrationTests(unittest.TestCase):
         with self.assertRaises(error.HTTPError) as caught:
             self.browser.open(req)
         self.assertEqual(caught.exception.code, 400)
-        self.assertEqual(json.load(caught.exception)["error"]["code"], -32020)
+        with caught.exception as response:
+            self.assertEqual(json.load(response)["error"]["code"], -32020)
         self.server_app.workspace.ensure_tenant("beta", self.workspace)
         foreign = self.server_app.workspace.call("beta", "session_create", {})
         with self.assertRaises(MCPError):
             client.call_tool("session_get", {"session_id": foreign["id"]})
+
+    def test_authenticated_direct_shell_without_session_metadata(self):
+        client = MCPClient(self.server_origin + "/mcp", self.login(), str(self.certs / "ca.pem"))
+        job = client.call_tool("shell", {"command": "printf direct-shell", "timeout_seconds": 5},
+                               context={"operation_id": "direct-shell-request"})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            result = client.call_tool("job_status", {"job_id": job["job_id"]})
+            if result["status"] in {"completed", "failed", "cancelled"}:
+                break
+            time.sleep(0.05)
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["stdout"], "direct-shell")
+
+    def test_read_only_oauth_scope_cannot_retrieve_session_credentials(self):
+        verifier = "read-only-verifier-" + "v" * 48
+        params = {"client_id": "mcp-agent-web", "redirect_uri": self.client_origin + "/auth/callback",
+            "resource": self.server_origin + "/mcp", "state": "scope-test", "response_type": "code",
+            "code_challenge_method": "S256", "scope": "workspace:read",
+            "code_challenge": base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")}
+        code = self.server_app.auth.authorize(params, "alice", "a-secure-test-password")
+        tokens = self.server_app.auth.token({"grant_type": "authorization_code", "code": code,
+            "client_id": params["client_id"], "redirect_uri": params["redirect_uri"],
+            "resource": params["resource"], "code_verifier": verifier})
+        session = self.server_app.workspace.call("alpha", "session_create", {"config": {"api_key": "scope-secret"}})
+        client = MCPClient(self.server_origin + "/mcp", tokens["access_token"], str(self.certs / "ca.pem"))
+        listing = client.call_tool("sessions_list", {})
+        self.assertNotIn("scope-secret", json.dumps(listing))
+        with self.assertRaises(MCPError) as caught:
+            client.call_tool("session_get", {"session_id": session["id"]})
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_maximum_artifact_download_fits_mcp_response_limit(self):
+        content = bytes(range(256)) * (16 * 1024 * 1024 // 256)
+        self.workspace.joinpath("large-artifact.bin").write_bytes(content)
+        client = MCPClient(self.server_origin + "/mcp", self.login(), str(self.certs / "ca.pem"))
+        result = client.call_tool("file_download", {"path": "large-artifact.bin"})
+        self.assertEqual(result["size"], len(content))
+        self.assertEqual(base64.b64decode(result["content_base64"], validate=True), content)
+
+    def test_mcp_missing_metadata_and_unsupported_delete(self):
+        token = self.login()
+        message = {"jsonrpc": "2.0", "id": "missing-version", "method": "tools/list",
+                   "params": {"_meta": {"io.modelcontextprotocol/clientCapabilities": {}}}}
+        headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                   "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": VERSION,
+                   "Mcp-Method": "tools/list"}
+        req = request.Request(self.server_origin + "/mcp", json.dumps(message).encode(), headers)
+        with self.assertRaises(error.HTTPError) as caught:
+            self.browser.open(req)
+        with caught.exception as response:
+            self.assertEqual(response.code, 400)
+            payload = json.load(response)
+            self.assertEqual(payload["id"], "missing-version")
+            self.assertEqual(payload["error"]["code"], -32602)
+        req = request.Request(self.server_origin + "/mcp", method="DELETE")
+        with self.assertRaises(error.HTTPError) as caught:
+            self.browser.open(req)
+        with caught.exception as response:
+            self.assertEqual(response.code, 405)
 
 
 if __name__ == "__main__":

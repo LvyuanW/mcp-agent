@@ -125,12 +125,14 @@ class Application:
         if not isinstance(params, dict) or not isinstance(params.get("_meta"), dict):
             raise RPCError(-32602, "Request metadata is required")
         meta = params["_meta"]
+        if not isinstance(meta.get(META + "protocolVersion"), str):
+            raise RPCError(-32602, "Protocol version metadata is required")
+        if not isinstance(meta.get(META + "clientCapabilities"), dict):
+            raise RPCError(-32602, "Client capabilities are required")
         validate_mirrors(headers, message)
         if meta.get(META + "protocolVersion") != VERSION:
             raise RPCError(-32022, "Unsupported protocol version", data={"supported": [VERSION],
                            "requested": meta.get(META + "protocolVersion")})
-        if not isinstance(meta.get(META + "clientCapabilities"), dict):
-            raise RPCError(-32602, "Client capabilities are required")
         method = message["method"]
         if method == "server/discover":
             result = {"supportedVersions": [VERSION], "capabilities": {"tools": {}},
@@ -149,18 +151,21 @@ class Application:
                 raise RPCError(-32602, "Tool arguments must be an object")
             validate_mirrors(headers, message, spec)
             required = {"workspace:read"}
-            if name.startswith("session_") and name not in {"session_get"}:
+            if name.startswith("session_"):
                 required.add("agent:run")
-            if name in {"shell", "job_cancel"}:
+            if name in {"shell", "job_cancel", "file_upload"}:
                 required.update({"workspace:write", "agent:run"})
             if not required <= principal.scopes:
                 raise AuthError("Insufficient permission", "insufficient_scope", 403)
-            context = {key: meta.get("io.mcp-agent/" + key) for key in ("session_id", "operation_id", "lease_token")}
+            context = {key: meta["io.mcp-agent/" + key] for key in ("session_id", "operation_id", "lease_token")
+                       if meta.get("io.mcp-agent/" + key) is not None}
             try:
                 value = self.workspace.call(principal.tenant_id, name, arguments, context=context)
                 if name == "workspace_info":
                     value["username"] = principal.username
-                result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}],
+                text_value = ({key: item for key, item in value.items() if key != "content_base64"}
+                              if name == "file_download" else value)
+                result = {"content": [{"type": "text", "text": json.dumps(text_value, ensure_ascii=False)}],
                           "structuredContent": value, "isError": False}
             except (ValueError, LookupError, RuntimeError) as error:
                 detail = {"error": {"code": getattr(error, "code", "tool_error"), "message": str(error)}}
@@ -276,7 +281,7 @@ def make_handler(app):
                 self.auth_error(error)
             except (ValueError, KeyError) as error:
                 if urlparse(self.path).path == "/mcp":
-                    code = -32700 if isinstance(error, json.JSONDecodeError) else -32600
+                    code = -32700 if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)) else -32600
                     failure = {"jsonrpc": "2.0", "error": {"code": code, "message": str(error)}}
                     if isinstance(message, dict) and type(message.get("id")) in (str, int):
                         failure["id"] = message["id"]
@@ -286,7 +291,20 @@ def make_handler(app):
             except Exception:
                 import traceback
                 traceback.print_exc()
-                self.fail(500, "Server error; inspect service logs")
+                if urlparse(self.path).path == "/mcp":
+                    failure = {"jsonrpc": "2.0", "error": {"code": -32603, "message": "Internal server error"}}
+                    if isinstance(message, dict) and type(message.get("id")) in (str, int):
+                        failure["id"] = message["id"]
+                    self.respond(500, failure)
+                else:
+                    self.fail(500, "Server error; inspect service logs")
+
+        def do_DELETE(self):
+            try:
+                self.check_origin()
+                self.respond(405, {"error": "MCP uses independent POST requests"}, headers=[("Allow", "POST")])
+            except AuthError as error:
+                self.auth_error(error)
 
     return MCPHandler
 

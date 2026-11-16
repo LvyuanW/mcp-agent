@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from urllib import error, request
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 import uuid
 
 if __package__ in {None, ""}:
@@ -40,6 +40,9 @@ def public_session(session):
     config = session.setdefault("config", {})
     config["api_key_set"] = bool(config.pop("api_key", ""))
     session.pop("lease_token", None)
+    if isinstance(session.get("lease"), dict):
+        session["lease"] = {key: session["lease"][key] for key in ("owner", "expires_at", "epoch")
+                            if key in session["lease"]}
     return session
 
 
@@ -129,21 +132,34 @@ class Application:
         key = (tenant_id, session_id)
         with self.worker_lock:
             current = self.workers.get(key)
-            if current and current.is_alive():
+            if current and current["thread"].is_alive():
+                # A request can arrive after the remote lease was released but
+                # before this local thread exits. The current thread must drain it.
+                current["requested"] = True
+                current["access_token"] = access_token
                 return
 
+            worker = {"requested": False, "access_token": access_token}
+
             def run():
-                try:
-                    AgentRunner(self.mcp(access_token), model_factory=self.model_factory).run(session_id)
-                except Exception as exc:
-                    # Runner saves recoverable errors remotely. Lease conflicts belong to another worker.
-                    print(f"Agent runner stopped ({type(exc).__name__})", file=sys.stderr)
-                finally:
+                while True:
                     with self.worker_lock:
+                        token = worker["access_token"]
+                        worker["requested"] = False
+                    try:
+                        AgentRunner(self.mcp(token), model_factory=self.model_factory).run(session_id)
+                    except Exception as exc:
+                        # Runner saves recoverable errors remotely. Lease conflicts belong to another worker.
+                        print(f"Agent runner stopped ({type(exc).__name__})", file=sys.stderr)
+                    with self.worker_lock:
+                        if worker["requested"]:
+                            continue
                         self.workers.pop(key, None)
+                        return
 
             thread = threading.Thread(target=run, name="agent-" + session_id[:8], daemon=True)
-            self.workers[key] = thread
+            worker["thread"] = thread
+            self.workers[key] = worker
             thread.start()
 
 
@@ -247,6 +263,13 @@ def make_handler(app):
                     elif path in {"/api/files", "/api/file"}:
                         arguments = {"path": query.get("path", [""])[0]}
                         self.respond(200, mcp.call_tool("files_list" if path == "/api/files" else "file_read", arguments))
+                    elif path == "/api/download":
+                        result = mcp.call_tool("file_download", {"path": query.get("path", [""])[0]})
+                        body = base64.b64decode(result["content_base64"], validate=True)
+                        filename = quote(Path(result["path"]).name, safe="")
+                        self.respond(200, body, result["mime_type"], headers=[
+                            ("Content-Disposition", "attachment; filename*=UTF-8''" + filename),
+                            ("Content-Security-Policy", "sandbox; default-src 'none'")])
                     else:
                         self.fail(404, "API not found")
                 else:
@@ -288,6 +311,11 @@ def make_handler(app):
                     return
                 mcp, token = self.remote()
                 body = self.json_body()
+                if path == "/api/upload":
+                    if set(body) - {"path", "content_base64", "expected_revision"}:
+                        raise ValueError("Unsupported upload parameters")
+                    self.respond(201, mcp.call_tool("file_upload", body))
+                    return
                 if path == "/api/sessions":
                     config = {**app.config["model_defaults"], **validate_config(body.get("config", {}))}
                     session = mcp.call_tool("session_create", {"title": body.get("title") or "新会话", "config": config})
@@ -323,14 +351,18 @@ def make_handler(app):
                         if session.get("status") == "running" or session.get("pending"):
                             raise MCPError("请先完成或取消当前任务。", status=409)
                         messages.append({"role": "user", "content": [{"type": "text", "text": content.strip()}], "request_id": operation})
-                        title = content.strip().replace("\n", " ")[:40] if len(messages) == 1 else session["title"]
+                        title = session["title"]
+                        if len(messages) == 1 and title == "新会话":
+                            title = content.strip().replace("\n", " ")[:40]
                         session = mcp.call_tool("session_update", {"session_id": session_id, "expected_revision": session["revision"],
                             "patch": {"messages": messages, "status": "running", "error": None, "title": title,
                                       "cancel_requested": False}})
                 elif action != "resume":
                     self.fail(404, "Unknown session action")
                     return
-                elif session.get("cancel_requested") and session.get("status") != "running":
+                elif session.get("cancel_requested"):
+                    # The server rejects this CAS while any runner owns an active
+                    # lease. After expiry, even a stale running session can resume.
                     session = mcp.call_tool("session_update", {"session_id": session_id,
                         "expected_revision": session["revision"], "patch": {"cancel_requested": False}})
                 app.start_runner(token, session.get("tenant_id", ""), session_id)

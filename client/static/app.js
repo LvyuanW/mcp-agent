@@ -310,7 +310,7 @@ async function createSession(config = null) {
   const selectedConfig = config || configWithoutSecrets(state.bootstrap?.model_defaults || {});
   const session = await api('/api/sessions', {
     method: 'POST',
-    body: JSON.stringify({title: '新的任务', config: selectedConfig}),
+    body: JSON.stringify({config: selectedConfig}),
   });
   ++state.selectionVersion;
   state.current = session;

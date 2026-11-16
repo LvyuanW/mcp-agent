@@ -169,10 +169,15 @@ class OAuthService:
             if grant_type == "refresh_token":
                 row = db.execute("SELECT * FROM tokens WHERE digest=? AND kind='refresh'",
                                  (digest(params.get("refresh_token", "")),)).fetchone()
-                if not row or row["used"] or row["expires"] < time.time():
+                if not row or row["expires"] < time.time():
                     raise AuthError("Expired or consumed refresh token", "invalid_grant")
                 if row["client_id"] != params["client_id"] or row["resource"] != params["resource"]:
                     raise AuthError("Refresh token audience mismatch", "invalid_grant")
+                if row["used"]:
+                    db.execute("DELETE FROM tokens WHERE grant_id=?", (row["grant_id"],))
+                    # Persist the revocation even though this request returns an error.
+                    db.commit()
+                    raise AuthError("Refresh token replay detected; sign in again", "invalid_grant")
                 db.execute("UPDATE tokens SET used=1 WHERE digest=?", (row["digest"],))
                 return self._issue_tokens(db, row["username"], row["client_id"], row["resource"],
                                           row["scope"], row["grant_id"])
