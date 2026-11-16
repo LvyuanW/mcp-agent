@@ -256,6 +256,42 @@ class RuntimeTests(unittest.TestCase):
 
 
 class CompactionTests(unittest.TestCase):
+    def test_restarted_projection_keeps_compaction_without_dropping_new_reasoning(self):
+        class NativeModel:
+            max_output_tokens = 512
+            count = 10000
+
+            def count_tokens(inner, *args):
+                return inner.count
+
+            def complete(inner, *args, **kwargs):
+                return {"role": "assistant", "content": "Earlier work."}
+
+            def compact_messages(inner, messages):
+                projected = deepcopy(messages)
+                for message in projected:
+                    message.pop("_native_reasoning", None)
+                return projected
+
+        model = NativeModel()
+        messages = [{"role": "user", "content": "Goal"}]
+        for index in range(10):
+            messages.append({"role": "assistant", "content": str(index), "_native_reasoning": "old",
+                             "_token_usage": {"tokens": 10000}})
+        original = deepcopy(messages)
+        session = {"messages": messages, "config": {"context_window": 4096}}
+        _, selected, context = prepare_context(session, model, "System", [])
+        self.assertTrue(all("_native_reasoning" not in message for message in selected))
+        messages += [{"role": "user", "content": "Continue"},
+                     {"role": "assistant", "content": "New work", "_native_reasoning": "preserve-new"}]
+        model.count = 100
+        session["context"] = context
+        _, restarted, _ = prepare_context(session, model, "System", [])
+        self.assertTrue(all("_native_reasoning" not in message and "_token_usage" not in message
+                            for message in restarted[:-1]))
+        self.assertEqual(restarted[-1]["_native_reasoning"], "preserve-new")
+        self.assertEqual(messages[:len(original)], original)
+
     def test_compaction_preserves_raw_history_and_complete_tool_groups(self):
         messages = [{"role": "user", "content": "Keep the original requirement."}]
         for index in range(12):

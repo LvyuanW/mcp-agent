@@ -64,13 +64,22 @@ def prepare_context(session, model, system, tools, *, on_activity=None):
             or (cursor and state.get("source_hash") != _digest(messages[:cursor]))):
         state, cursor = {}, 0
     summary = state.get("summary", "")
+    compacted_through = state.get("compacted_through", 0)
+    if type(compacted_through) is not int or not cursor <= compacted_through <= len(messages):
+        compacted_through = 0
     config = session.get("config", {})
     window = int(config.get("context_window") or 128000)
     reserve = int(config.get("max_output_tokens") or getattr(model, "max_output_tokens", 8192))
     budget = max(1024, window - reserve)
 
     def projected(position):
-        result = deepcopy(messages[position:])
+        boundary = max(position, compacted_through)
+        compacted = deepcopy(messages[position:boundary])
+        if compacted:
+            compacted = getattr(model, "compact_messages", deepcopy)(compacted)
+            for message in compacted:
+                message.pop("_token_usage", None)
+        result = compacted + deepcopy(messages[boundary:])
         latest_user = next((index for index in range(len(messages) - 1, -1, -1)
                             if messages[index].get("role") == "user"), None)
         if latest_user is not None and latest_user < position:
@@ -116,11 +125,10 @@ def prepare_context(session, model, system, tools, *, on_activity=None):
             if not summary:
                 raise ValueError("Context compaction returned an empty summary")
         cursor = cutoff
+        compacted_through = len(messages)
         selected = projected(cursor)
-        selected = getattr(model, "compact_messages", deepcopy)(selected)
         message_groups(selected)
-        for message in selected:
-            message.pop("_token_usage", None)
-        state = {"cursor": cursor, "summary": summary, "source_hash": _digest(messages[:cursor])}
+        state = {"cursor": cursor, "summary": summary, "source_hash": _digest(messages[:cursor]),
+                 "compacted_through": compacted_through}
     state["usage"] = {"tokens": count, "source": source, "context_window": window}
     return with_summary(summary), selected, state
