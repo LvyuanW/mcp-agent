@@ -159,7 +159,8 @@ class MCPClient:
             with self.opener.open(req, timeout=self.timeout) as response:
                 return self._read_response(response, identifier)
         except error.HTTPError as exc:
-            body = exc.read(MAX_RESPONSE_BYTES)
+            with exc:
+                body = exc.read(MAX_RESPONSE_BYTES)
             try:
                 value = json.loads(body)
                 problem = value.get("error", {})

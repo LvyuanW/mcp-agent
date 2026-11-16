@@ -3,6 +3,7 @@ import json
 from email.message import Message
 import ssl
 import unittest
+from urllib.error import HTTPError
 
 from client.mcp import MCPClient, MCPError, MCPToolError, MCPTransportError, encode_header, header_bindings, sse_messages
 
@@ -42,6 +43,19 @@ class MCPTests(unittest.TestCase):
         client = MCPClient("https://localhost/mcp", "secret")
         self.assertEqual(client.context.verify_mode, ssl.CERT_REQUIRED)
         self.assertTrue(client.context.check_hostname)
+
+    def test_http_error_response_is_closed_after_decoding(self):
+        body = io.BytesIO(b'{"error":{"code":"forbidden","message":"Scope required"}}')
+        failure = HTTPError("https://example.test/mcp", 403, "Forbidden", {}, body)
+
+        def responder(req):
+            raise failure
+
+        client = self.client(responder)
+        with self.assertRaisesRegex(MCPError, "Scope required") as caught:
+            client.call("tools/list")
+        self.assertEqual(caught.exception.status, 403)
+        self.assertTrue(body.closed)
 
     def test_modern_headers_metadata_and_tool_result(self):
         client = self.client(lambda req: result(req, {"structuredContent": {"ok": True}}))
