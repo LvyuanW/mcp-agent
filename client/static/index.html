@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#202822">
+  <meta name="color-scheme" content="light">
+  <title>MCP Agent</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到工作区</a>
+  <div id="connection-screen" class="connection-screen">
+    <div class="connection-layout">
+      <div class="connection-intro">
+        <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>mcp<span class="brand-light">agent</span></span></div>
+        <div class="connection-copy">
+          <div class="overline">你的远程工作区</div>
+          <h1>接着上一次，<br>把事情做好。</h1>
+          <p>会话、技能和工作成果保存在远端。<br>从这里连接，继续你的工作。</p>
+        </div>
+        <div class="connection-footer">Shell + Skills <span aria-hidden="true">·</span> MCP over HTTPS</div>
+      </div>
+      <section class="connection-card" aria-labelledby="connection-title">
+        <div class="connection-symbol" aria-hidden="true">↗</div>
+        <h2 id="connection-title">连接你的 Agent</h2>
+        <p id="connection-description">正在检查 MCP 服务连接。</p>
+        <div class="endpoint-block"><span class="field-label">MCP 服务</span><code id="login-endpoint">正在读取配置…</code></div>
+        <p id="connection-error" class="inline-error" role="alert" hidden></p>
+        <a id="login-button" class="button button-primary connection-action" href="/auth/login" hidden>登录并连接 <span aria-hidden="true">↗</span></a>
+        <button id="connection-retry" class="button button-secondary connection-action" type="button" hidden>重新连接</button>
+        <div id="connection-loading" class="loading-line" role="status"><span class="spinner" aria-hidden="true"></span> 正在连接</div>
+        <p class="connection-note">通过 MCP 服务端授权后，载入你的会话与工作区。</p>
+      </section>
+    </div>
+  </div>
+
+  <div id="app" class="app" hidden>
+    <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+    <aside id="sidebar" class="sidebar" aria-label="会话导航">
+      <div class="sidebar-heading">
+        <a class="brand" href="/" aria-label="MCP Agent 首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>mcp<span class="brand-light">agent</span></span></a>
+        <button id="close-sidebar" class="icon-button mobile-only" aria-label="关闭会话导航" type="button">×</button>
+      </div>
+      <button id="new-session" class="new-session" type="button"><span aria-hidden="true">＋</span> 新的任务 <span class="shortcut" aria-hidden="true">↗</span></button>
+      <div class="session-search"><span aria-hidden="true">⌕</span><input id="session-search" type="search" placeholder="搜索会话" aria-label="搜索会话" autocomplete="off"></div>
+      <div class="sidebar-section-label">会话 <span id="session-count"></span></div>
+      <nav id="session-list" class="session-list" aria-label="远端会话"></nav>
+      <div id="session-list-error" class="sidebar-error" hidden><p></p><button type="button" id="sessions-retry">重新加载</button></div>
+      <div class="sidebar-bottom">
+        <button id="workspace-navigation" class="workspace-navigation" type="button"><span class="folder-icon" aria-hidden="true"></span><span><span id="workspace-name">远程工作区</span><small id="workspace-tenant"></small></span><span class="navigation-arrow" aria-hidden="true">↗</span></button>
+        <div class="account-row"><span class="avatar" id="user-avatar" aria-hidden="true">U</span><div class="account-name"><strong id="user-name">已连接</strong><span><i class="connection-dot" aria-hidden="true"></i>远端会话已连接</span></div><button id="logout-button" class="icon-button" title="退出登录" aria-label="退出登录" type="button">⇥</button></div>
+      </div>
+    </aside>
+
+    <main id="main-content" class="main" tabindex="-1">
+      <header class="topbar">
+        <div class="topbar-title"><button id="open-sidebar" class="icon-button mobile-only" type="button" aria-label="打开会话导航" aria-controls="sidebar" aria-expanded="false">☰</button><span class="breadcrumb" id="workspace-breadcrumb">工作区</span><span class="breadcrumb-divider" aria-hidden="true">/</span><h1 id="session-title">新的任务</h1></div>
+        <div class="topbar-actions"><button id="chat-tab" class="view-tab active" type="button" aria-pressed="true">对话</button><button id="files-tab" class="view-tab" type="button" aria-pressed="false">文件</button><button id="capabilities-button" class="icon-button" title="远端工具与技能" aria-label="远端工具与技能" type="button">◇</button><button id="settings-button" class="icon-button" title="模型设置" aria-label="模型设置" type="button">⚙</button></div>
+      </header>
+
+      <div id="page-error" class="page-error" role="alert" hidden><p></p><button type="button" id="page-error-dismiss" aria-label="关闭错误提示">×</button></div>
+
+      <section id="chat-view" class="chat-view" aria-label="Agent 对话">
+        <div id="chat-scroll" class="chat-scroll">
+          <div id="empty-state" class="empty-state">
+            <div class="empty-emblem" aria-hidden="true"><span></span><span></span><span></span></div>
+            <p class="overline" id="empty-workspace">远程工作区已就绪</p>
+            <h2>今天要完成什么？</h2>
+            <p class="empty-description">让 Agent 阅读项目、修改代码或运行测试。<br>每一步都在你的远程工作区中执行。</p>
+            <div class="suggestions" aria-label="任务示例">
+              <button type="button" data-prompt="先阅读工作区中的项目说明和可用技能，帮我梳理项目结构与启动方式。"><span aria-hidden="true">↗</span><strong>了解这个项目</strong><span>梳理结构与运行方式</span></button>
+              <button type="button" data-prompt="阅读项目的测试说明和相关技能，运行现有测试，分析失败原因并修复问题。"><span aria-hidden="true">↗</span><strong>检查并修复问题</strong><span>从测试结果开始</span></button>
+              <button type="button" data-prompt="查看当前工作区的 Git 改动，检查潜在问题，并总结需要关注的地方。"><span aria-hidden="true">↗</span><strong>审查当前改动</strong><span>检查代码与变更影响</span></button>
+            </div>
+          </div>
+          <ol id="messages" class="messages" aria-label="会话消息" aria-live="off"></ol>
+        </div>
+        <div class="composer-area">
+          <div id="run-status" class="run-status" role="status" aria-live="polite" hidden><div><span id="run-status-icon" aria-hidden="true"></span><span id="run-status-text"></span></div><button id="resume-button" class="text-button" type="button" hidden>继续执行 <span aria-hidden="true">→</span></button></div>
+          <form id="composer-form" class="composer">
+            <label for="composer-input" class="sr-only">发送任务</label>
+            <textarea id="composer-input" rows="2" placeholder="描述任务，或接着上次的工作…" spellcheck="false" autocomplete="off"></textarea>
+            <div class="composer-toolbar"><button id="composer-model" class="model-button" type="button" title="配置模型"><span class="model-symbol" aria-hidden="true">◇</span><span id="model-label">配置模型</span><span class="model-chevron" aria-hidden="true">⌄</span></button><div class="composer-right"><span class="keyboard-hint">Enter 发送 · Shift + Enter 换行</span><button id="stop-button" class="button stop-button" type="button" hidden><span aria-hidden="true">■</span> 停止</button><button id="send-button" class="send-button" type="submit" aria-label="发送任务" disabled>↑</button></div></div>
+          </form>
+          <div class="composer-footnote"><span><i class="connection-dot" aria-hidden="true"></i><span id="composer-workspace">远端执行</span></span><span id="save-status">会话与产物保存至 MCP 服务端</span></div>
+        </div>
+      </section>
+
+      <section id="files-view" class="files-view" aria-label="远程工作区文件" hidden>
+        <div class="files-toolbar"><div><p class="overline">远程文件</p><h2>工作区</h2></div><div class="file-actions"><input id="upload-file-input" type="file" hidden><button id="upload-file-button" class="button button-secondary" type="button">上传文件</button><button id="refresh-files" class="button button-secondary" type="button">刷新</button></div></div>
+        <div id="file-breadcrumbs" class="file-breadcrumbs" aria-label="当前目录"></div>
+        <div class="files-layout"><div class="file-list-pane"><div class="file-list-heading"><span>名称</span><span>大小</span></div><div id="file-list" class="file-list"></div></div><section class="file-preview" aria-label="文件预览"><header><span id="preview-name">文件预览</span><div class="file-actions"><button id="download-file" class="text-button" type="button" hidden>下载</button><button id="copy-file" class="text-button" type="button" hidden>复制内容</button></div></header><div id="file-preview-empty" class="file-preview-empty"><span class="file-page-icon" aria-hidden="true"></span><p>选择文件以查看内容</p><span>文件来自当前远程工作区</span></div><pre id="file-content" tabindex="0" hidden></pre><p id="file-preview-note" class="file-preview-note" hidden></p></section></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
+    <form id="settings-form">
+      <div class="dialog-header"><div><p class="overline">会话配置</p><h2 id="settings-title">模型设置</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="关闭模型设置">×</button></div>
+      <p class="dialog-description" id="settings-description">配置当前会话使用的模型，设置保存至远端。</p>
+      <div class="form-grid">
+        <label>服务提供方<select name="provider" id="provider-input"><option value="openai">OpenAI 兼容接口</option><option value="anthropic">Anthropic</option></select></label>
+        <label>API 格式<select name="api_format" id="format-input"><option value="auto">自动选择</option><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label>
+        <label class="full-width">模型名称<input name="model" id="model-input" type="text" placeholder="填写服务商的模型 ID" required autocomplete="off"></label>
+        <label class="full-width">API 地址<input name="base_url" id="base-url-input" type="url" placeholder="https://api.openai.com/v1" autocomplete="off"><span class="field-help">留空使用提供方默认地址。</span></label>
+        <label class="full-width">API Key<input name="api_key" id="api-key-input" type="password" placeholder="输入 API Key" autocomplete="new-password"><span id="api-key-note" class="field-help">加密传输到服务端，浏览器不会保存此密钥。</span></label>
+        <label>最大输出 tokens<input name="max_output_tokens" id="output-tokens-input" type="number" min="1" step="1" value="8192" required></label>
+        <label>上下文窗口 tokens<input name="context_window" id="context-window-input" type="number" min="1024" step="1" value="128000" required></label>
+      </div>
+      <p id="settings-error" class="inline-error" role="alert" hidden></p>
+      <div class="dialog-footer"><button type="button" class="button button-secondary" data-close-dialog>取消</button><button id="save-settings" type="submit" class="button button-primary">保存设置</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="capabilities-dialog" class="capabilities-dialog" aria-labelledby="capabilities-title"><div class="dialog-header"><div><p class="overline">MCP 服务</p><h2 id="capabilities-title">工具与技能</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭工具与技能">×</button></div><div class="capabilities-endpoint"><i class="connection-dot" aria-hidden="true"></i><code id="capabilities-endpoint"></code></div><div class="capabilities-body"><section><h3>远端工具 <span id="tools-count"></span></h3><div id="tools-list"></div></section><section><h3>工作区技能 <span id="skills-count"></span></h3><div id="skills-list"></div></section></div></dialog>
+
+  <dialog id="upload-dialog" class="settings-dialog" aria-labelledby="upload-title"><form id="upload-form"><div class="dialog-header"><div><p class="overline">远程工作区</p><h2 id="upload-title">上传文件</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭上传">×</button></div><p id="upload-description" class="dialog-description"></p><div class="form-grid"><label class="full-width">保存路径<input id="upload-path" type="text" required autocomplete="off"><span class="field-help">相对于工作区根目录，单个文件最大 8 MiB。</span></label></div><p id="upload-error" class="inline-error" role="alert" hidden></p><div class="dialog-footer"><button type="button" class="button button-secondary" data-close-dialog>取消</button><button id="upload-submit" type="submit" class="button button-primary">上传</button></div></form></dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
