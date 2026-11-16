@@ -1,3 +1,5 @@
+import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -123,6 +125,19 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(NotFoundError):
             self.call("job_cancel", {"job_id": first["job_id"]}, tenant="bob")
 
+    def test_concurrent_shell_submissions_execute_once(self):
+        def submit(_):
+            return self.call("shell", {"command": "printf 'one\\n' >> concurrent.txt", "timeout_seconds": 5},
+                             {"operation_id": "concurrent"})
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            replies = list(pool.map(submit, range(4)))
+        identifiers = {reply["job_id"] for reply in replies}
+        self.assertEqual(len(identifiers), 1)
+        identifier = identifiers.pop()
+        self.jobs.append(("alice", identifier))
+        self.assertEqual(self.wait(identifier)["status"], "completed")
+        self.assertEqual((self.workspace / "concurrent.txt").read_text(), "one\n")
+
     def test_shell_requires_operation_and_current_session_lease(self):
         with self.assertRaises(InputError):
             self.call("shell", {"command": "true"})
@@ -201,6 +216,48 @@ os._exit(0)
         result = self.wait(self.shell("cat " + shlex.quote(info["skills"][0]["path"]), operation="skill")["job_id"])
         self.assertEqual(result["status"], "completed", result)
         self.assertIn("name:", result["stdout"])
+
+    def test_binary_artifact_roundtrip_and_revision_conflict(self):
+        content = bytes(range(256)) * 20
+        arguments = {"path": "artifacts/output.bin", "content_base64": base64.b64encode(content).decode(),
+                     "expected_revision": None}
+        uploaded = self.call("file_upload", arguments)
+        downloaded = self.call("file_download", {"path": arguments["path"]})
+        self.assertEqual(base64.b64decode(downloaded["content_base64"]), content)
+        self.assertEqual(downloaded["mime_type"], "application/octet-stream")
+        self.assertEqual(downloaded["revision"], uploaded["revision"])
+        with self.assertRaises(ConflictError):
+            self.call("file_upload", arguments)
+        arguments.update(expected_revision=uploaded["revision"], content_base64=base64.b64encode(b"updated").decode())
+        self.call("file_upload", arguments)
+        with self.assertRaises(ConflictError):
+            self.call("file_upload", arguments)
+        self.assertEqual((self.workspace / "artifacts/output.bin").read_bytes(), b"updated")
+
+    def test_artifact_traversal_and_symlinks_are_rejected(self):
+        outside = self.other_workspace / "secret.bin"
+        outside.write_bytes(b"other-tenant")
+        (self.workspace / "link").symlink_to(self.other_workspace, target_is_directory=True)
+        for path in ("../other-project/secret.bin", str(outside), "link/secret.bin"):
+            with self.subTest(path=path):
+                with self.assertRaises(InputError):
+                    self.call("file_download", {"path": path})
+                with self.assertRaises(InputError):
+                    self.call("file_upload", {"path": path, "content_base64": "b3ZlcndyaXR0ZW4="})
+        self.assertEqual(outside.read_bytes(), b"other-tenant")
+        with self.assertRaises(InputError):
+            self.call("file_upload", {"path": "invalid.bin", "content_base64": "not!base64"})
+
+    def test_stale_runner_cannot_cancel_job(self):
+        session = self.call("session_create")
+        claim = self.call("session_claim", {"session_id": session["id"], "owner": "runner"})
+        context = {"session_id": session["id"], "lease_token": claim["lease_token"]}
+        job = self.shell("sleep 3", operation="fenced-cancel", timeout=5, context=context)
+        self.call("session_release", {"session_id": session["id"], "lease_token": claim["lease_token"]})
+        with self.assertRaises(ConflictError):
+            self.call("job_cancel", {"job_id": job["job_id"]}, context)
+        self.call("session_cancel", {"session_id": session["id"]})
+        self.assertEqual(self.wait(job["job_id"])["status"], "cancelled")
 
     def test_execution_user_requires_privileged_configuration(self):
         if os.geteuid() == 0:

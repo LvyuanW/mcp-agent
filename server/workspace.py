@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import base64
 import hashlib
 import json
 import math
+import mimetypes
 import os
 from pathlib import Path
 import pwd
 import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -37,6 +40,8 @@ SESSION_STATUSES = {"idle", "running", "completed", "error", "cancelled"}
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 MAX_FILE_BYTES = 512 * 1024
 MAX_LOG_BYTES = 1024 * 1024
+MAX_DOWNLOAD_BYTES = 16 * 1024 * 1024
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 
 
 def connect_database(path):
@@ -82,10 +87,135 @@ def _schema(name, description, properties=None, required=(), *, runtime=True):
     return specification
 
 
+def _relative_parts(workspace, value):
+    if not isinstance(value, str) or "\0" in value:
+        raise InputError("path must be a string")
+    path = Path(value)
+    if path.is_absolute():
+        try:
+            path = path.relative_to(workspace)
+        except ValueError:
+            raise InputError("Path must remain inside the configured workspace") from None
+    if ".." in path.parts:
+        raise InputError("Parent path traversal is not supported")
+    return [part for part in path.parts if part != "."]
+
+
+@contextmanager
+def _directory_descriptor(workspace, parts, *, create=False):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(workspace, flags)
+    try:
+        for part in parts:
+            if create:
+                try:
+                    os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            following = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = following
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _read_regular_file(parent, name, maximum):
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise InputError("Path must identify a regular file")
+        data = source.read(maximum + 1)
+        after = os.fstat(source.fileno())
+        if (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ConflictError("File changed while it was being read", "revision_conflict")
+    if len(data) > maximum:
+        raise InputError(f"File exceeds this transfer's {maximum}-byte limit; use shell for larger files")
+    return data, stat.S_IMODE(metadata.st_mode)
+
+
+def _file_operation(workspace, name, arguments):
+    """Descriptor-relative operations never follow workspace symlinks."""
+    workspace = Path(workspace)
+    parts = _relative_parts(workspace, arguments.get("path", "."))
+    relative = "/".join(parts) or "."
+    if name == "files_list":
+        with _directory_descriptor(workspace, parts) as directory:
+            entries = []
+            names = sorted(os.listdir(directory), key=str.casefold)
+            for filename in names[:2000]:
+                info = os.stat(filename, dir_fd=directory, follow_symlinks=False)
+                kind = "symlink" if stat.S_ISLNK(info.st_mode) else "directory" if stat.S_ISDIR(info.st_mode) else "file"
+                entries.append({"name": filename, "path": "/".join([*parts, filename]),
+                                "type": kind, "size": info.st_size})
+        return {"path": relative, "entries": entries, "truncated": len(names) > 2000}
+    if not parts:
+        raise InputError("A file path is required")
+    with _directory_descriptor(workspace, parts[:-1], create=name == "file_upload") as directory:
+        if name in {"file_read", "file_download"}:
+            maximum = MAX_FILE_BYTES if name == "file_read" else MAX_DOWNLOAD_BYTES
+            data, _ = _read_regular_file(directory, parts[-1], maximum)
+            result = {"path": relative, "revision": hashlib.sha256(data).hexdigest(), "size": len(data)}
+            if name == "file_read":
+                try:
+                    result["content"] = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise InputError("File is not UTF-8 text") from None
+            else:
+                result.update(content_base64=base64.b64encode(data).decode("ascii"),
+                              mime_type=mimetypes.guess_type(parts[-1])[0] or "application/octet-stream")
+            return result
+        encoded = arguments.get("content_base64")
+        if not isinstance(encoded, str) or len(encoded) > ((MAX_UPLOAD_BYTES + 2) // 3) * 4:
+            raise InputError("Upload exceeds the 8 MiB per-request transfer limit")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            raise InputError("content_base64 must be valid Base64") from None
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise InputError("Upload exceeds the 8 MiB per-request transfer limit")
+        try:
+            before, mode = _read_regular_file(directory, parts[-1], MAX_DOWNLOAD_BYTES)
+        except FileNotFoundError:
+            before, mode = None, 0o644
+        revision = hashlib.sha256(before).hexdigest() if before is not None else None
+        expected = arguments.get("expected_revision")
+        if expected is not None and not isinstance(expected, str):
+            raise InputError("expected_revision must be a string or null")
+        if "expected_revision" in arguments and arguments["expected_revision"] != revision:
+            raise ConflictError("File revision changed; read it again before uploading", "revision_conflict")
+        temporary = ".mcp-upload-" + uuid4().hex
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode=0o600, dir_fd=directory)
+        try:
+            with os.fdopen(descriptor, "wb") as destination:
+                destination.write(data)
+                destination.flush()
+                os.fchmod(destination.fileno(), mode)
+                os.fsync(destination.fileno())
+            try:
+                current, _ = _read_regular_file(directory, parts[-1], MAX_DOWNLOAD_BYTES)
+            except FileNotFoundError:
+                current = None
+            if current != before:
+                raise ConflictError("File changed while preparing upload", "revision_conflict")
+            if before is None:
+                os.link(temporary, parts[-1], src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+            else:
+                os.replace(temporary, parts[-1], src_dir_fd=directory, dst_dir_fd=directory)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+    return {"path": relative, "size": len(data), "revision": hashlib.sha256(data).hexdigest()}
+
+
 class WorkspaceService:
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.data_dir, 0o700)
         self.jobs_dir = self.data_dir / "jobs"
         self.jobs_dir.mkdir(exist_ok=True, mode=0o700)
         self.database = self.data_dir / "workspace.sqlite3"
@@ -188,6 +318,12 @@ class WorkspaceService:
             _schema("workspace_info", "Read this tenant's real workspace, remote skill paths and execution instructions."),
             _schema("files_list", "List a directory in the remote workspace.", {"path": text}),
             _schema("file_read", "Read a UTF-8 file in the remote workspace, bounded to 512 KiB.", {"path": text}, ["path"]),
+            _schema("file_download", "Download a remote workspace artifact, up to 16 MiB in one response.",
+                    {"path": text}, ["path"]),
+            _schema("file_upload", "Atomically upload a workspace artifact, up to 8 MiB per request. "
+                    "expected_revision is the previously read SHA-256; null requires a new file.", {
+                        "path": text, "content_base64": text, "expected_revision": {"type": ["string", "null"]}},
+                    ["path", "content_base64"]),
             _schema("sessions_list", "List the authenticated tenant's sessions."),
             _schema("session_create", "Create a durable remote session.", {"title": text, "config": {"type": "object"}}),
             _schema("session_get", "Load a durable session and current cancellation signal.", session, ["session_id"]),
@@ -202,7 +338,7 @@ class WorkspaceService:
             _schema("session_cancel", "Persist a cancellation request for the active session runner.", session, ["session_id"]),
             _schema("shell", "Start a durable shell job in the real remote workspace. Read remote-shell SKILL.md "
                     "from workspace_info when needed. Returns a job_id immediately. The runtime collects its final "
-                    "result. This uses the service account's actual OS permissions.", {
+                    "result. This uses the configured execution account's actual OS permissions.", {
                 "command": {"type": "string", "description": "Shell command or multiline script."},
                 "cwd": {"type": "string", "description": "Optional workspace-relative working directory."},
                 "timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 86400,
@@ -230,6 +366,7 @@ class WorkspaceService:
             workspace = self._workspace(connection, tenant_id)
         handlers = {
             "workspace_info": self._workspace_info, "files_list": self._files_list, "file_read": self._file_read,
+            "file_download": self._file_download, "file_upload": self._file_upload,
             "sessions_list": self._sessions_list, "session_create": self._session_create,
             "session_get": self._session_get, "session_update": self._session_update,
             "session_claim": self._session_claim, "session_release": self._session_release,
@@ -269,34 +406,48 @@ class WorkspaceService:
         return candidate
 
     def _files_list(self, tenant_id, workspace, arguments, context):
-        path = self._path(workspace, arguments.get("path", "."))
-        if not path.is_dir():
-            raise NotFoundError("Directory not found")
-        entries = []
-        for entry in sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold())):
-            if len(entries) >= 2000:
-                break
-            info = entry.lstat()
-            kind = "symlink" if entry.is_symlink() else "directory" if entry.is_dir() else "file"
-            entries.append({"name": entry.name, "path": entry.relative_to(workspace).as_posix(),
-                            "type": kind, "size": info.st_size})
-        return {"path": path.relative_to(workspace).as_posix(), "entries": entries,
-                "truncated": len(entries) == 2000}
+        return self._workspace_file_call(tenant_id, workspace, "files_list", arguments)
 
     def _file_read(self, tenant_id, workspace, arguments, context):
-        path = self._path(workspace, arguments["path"])
-        if not path.is_file():
-            raise NotFoundError("File not found")
-        with path.open("rb") as stream:
-            data = stream.read(MAX_FILE_BYTES + 1)
-        if len(data) > MAX_FILE_BYTES:
-            raise InputError("File exceeds the 512 KiB browser limit; inspect a selected range with shell")
+        return self._workspace_file_call(tenant_id, workspace, "file_read", arguments)
+
+    def _file_download(self, tenant_id, workspace, arguments, context):
+        return self._workspace_file_call(tenant_id, workspace, "file_download", arguments)
+
+    def _file_upload(self, tenant_id, workspace, arguments, context):
+        # Serialize version checks and writes across HTTP processes using this state DB.
+        with self._connection(transaction=True):
+            return self._workspace_file_call(tenant_id, workspace, "file_upload", arguments)
+
+    def _workspace_file_call(self, tenant_id, workspace, name, arguments):
+        with self._connection() as connection:
+            tenant = connection.execute("SELECT * FROM tenants WHERE id = ?", (tenant_id,)).fetchone()
         try:
-            content = data.decode("utf-8")
-        except UnicodeDecodeError:
-            raise InputError("File is not UTF-8 text") from None
-        return {"path": path.relative_to(workspace).as_posix(), "content": content,
-                "revision": hashlib.sha256(data).hexdigest(), "size": len(data)}
+            if tenant["execution_user"] is None:
+                return _file_operation(workspace, name, arguments)
+            account = pwd.getpwnam(tenant["execution_user"])
+            if os.geteuid() != 0 or account.pw_uid != tenant["execution_uid"] or account.pw_gid != tenant["execution_gid"]:
+                raise InputError("Configured execution user identity is unavailable")
+            environment = {"PATH": os.defpath, "HOME": account.pw_dir, "USER": account.pw_name,
+                           "LOGNAME": account.pw_name}
+            request = json.dumps({"workspace": str(workspace), "name": name, "arguments": arguments})
+            process = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--file-operation"],
+                                     input=request, capture_output=True, text=True, timeout=20, cwd=workspace,
+                                     env=environment, user=account.pw_uid, group=account.pw_gid, extra_groups=[],
+                                     close_fds=True)
+            if process.returncode:
+                raise InputError("Remote file helper failed; verify the execution account can read the service installation")
+            reply = json.loads(process.stdout)
+            if "error" in reply:
+                exception = {"not_found": NotFoundError, "revision_conflict": ConflictError}.get(reply["code"], InputError)
+                if exception is ConflictError:
+                    raise ConflictError(reply["error"], reply["code"])
+                raise exception(reply["error"])
+            return reply["result"]
+        except FileNotFoundError:
+            raise NotFoundError("File or directory not found") from None
+        except OSError as error:
+            raise InputError(f"File operation rejected: {error.strerror}") from None
 
     def _session_row(self, connection, tenant_id, session_id):
         session_id = _text(session_id, "session_id", maximum=200)
@@ -357,7 +508,7 @@ class WorkspaceService:
         protected = {"id", "tenant_id", "revision", "lease", "created_at", "updated_at"}
         if protected.intersection(patch):
             raise InputError("Session identity, revision, timestamps and lease are protected")
-        if "status" in patch and patch["status"] not in SESSION_STATUSES:
+        if "status" in patch and (not isinstance(patch["status"], str) or patch["status"] not in SESSION_STATUSES):
             raise InputError("Invalid session status")
         for field, expected_type in (("config", dict), ("messages", list), ("cancel_requested", bool)):
             if field in patch and not isinstance(patch[field], expected_type):
@@ -417,8 +568,8 @@ class WorkspaceService:
         cwd = self._path(workspace, arguments.get("cwd", "."))
         if not cwd.is_dir():
             raise NotFoundError("Working directory not found")
-        timeout = _number(arguments.get("timeout_seconds", 300), "timeout_seconds")
-        session_id = context.get("session_id", "")
+        timeout = float(_number(arguments.get("timeout_seconds", 300), "timeout_seconds"))
+        session_id = _text(context["session_id"], "context.session_id", maximum=200) if "session_id" in context else ""
         normalized = json.dumps({"command": command, "cwd": str(cwd), "timeout_seconds": timeout}, sort_keys=True)
         request_hash = hashlib.sha256(normalized.encode()).hexdigest()
         now = time.time()
@@ -429,7 +580,7 @@ class WorkspaceService:
                 if not session["lease_token"] or session["lease_expires"] <= now:
                     raise ConflictError("Shell dispatch requires an active session lease", "lease_conflict")
                 if session["cancel_requested"]:
-                    raise ConflictError("Session cancellation was requested", "session_cancelled")
+                    raise ConflictError("Session cancellation was requested", "cancelled")
             row = connection.execute("SELECT * FROM jobs WHERE tenant_id = ? AND session_id = ? AND operation_id = ?",
                                      (tenant_id, session_id, operation_id)).fetchone()
             if row is not None:
@@ -462,8 +613,9 @@ class WorkspaceService:
             threading.Thread(target=process.wait, daemon=True).start()
         except OSError as error:
             with self._connection(transaction=True) as connection:
-                connection.execute("UPDATE jobs SET error = ?, updated_at = ? WHERE id = ? AND status = 'queued'",
-                                   (f"Worker launch failed: {error}. A retry can resume this queued operation.", time.time(), identifier))
+                connection.execute("UPDATE jobs SET status = 'failed', error = ?, ended_at = ?, updated_at = ? "
+                                   "WHERE id = ? AND status = 'queued'",
+                                   (f"Worker launch failed: {error}", time.time(), time.time(), identifier))
 
     def _recover_queued_jobs(self):
         with self._connection() as connection:
@@ -513,7 +665,23 @@ class WorkspaceService:
     def _job_cancel(self, tenant_id, workspace, arguments, context):
         with self._connection(transaction=True) as connection:
             row = self._job_row(connection, tenant_id, arguments, context)
+            if context.get("session_id"):
+                session = self._session_row(connection, tenant_id, context["session_id"])
+                self._check_lease(session, context.get("lease_token"))
+                if not session["lease_token"] or session["lease_expires"] <= time.time():
+                    raise ConflictError("Runner cancellation requires an active session lease", "lease_conflict")
             connection.execute("UPDATE jobs SET cancel_requested = 1, updated_at = ? WHERE id = ? "
                                "AND status IN ('queued', 'running')", (time.time(), row["id"]))
         self._start_worker(row["id"])
         return self._job_status(tenant_id, workspace, arguments, context)
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["--file-operation"]:
+    try:
+        request = json.load(sys.stdin)
+        response = {"result": _file_operation(request["workspace"], request["name"], request["arguments"])}
+    except FileNotFoundError:
+        response = {"error": "File or directory not found", "code": "not_found"}
+    except Exception as error:
+        response = {"error": str(error), "code": getattr(error, "code", "invalid_input")}
+    print(json.dumps(response, ensure_ascii=False))
